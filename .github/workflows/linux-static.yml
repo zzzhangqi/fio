@@ -1,0 +1,155 @@
+name: Linux static binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional new tag for a draft release (for example static-fio-3.42-1)'
+        required: false
+        type: string
+  push:
+    branches: [master, 'codex/**']
+    paths:
+      - '.github/workflows/linux-static.yml'
+      - 'ci/*linux-static*'
+  pull_request:
+    paths:
+      - '.github/workflows/linux-static.yml'
+      - 'ci/*linux-static*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-static-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Official fio-3.42 release commit; update deliberately when upgrading.
+  FIO_SOURCE_COMMIT: ab77643023f5d7e3c1b71a7576a564f368bf577a
+  FIO_BUILDER_IMAGE: alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1
+
+jobs:
+  build:
+    name: Build and verify ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout packaging scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Checkout pinned fio release
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.FIO_SOURCE_COMMIT }}
+          path: source
+          persist-credentials: false
+      - name: Apply upstream musl fix and archive matching source
+        env:
+          FIO_ARCH: ${{ matrix.arch }}
+        run: |
+          git -C source apply ../ci/linux-static-musl.patch
+          mkdir -p dist
+          if [ "$FIO_ARCH" = amd64 ]; then
+            git -C source ls-files -z | tar -C source --null -T - \
+              --transform='s,^,fio-source/,' -czf "$PWD/dist/fio-source.tar.gz"
+          fi
+      - name: Build static binary and run upstream smoke tests
+        env:
+          FIO_ARCH: ${{ matrix.arch }}
+          FIO_PACKAGING_COMMIT: ${{ github.sha }}
+        run: |
+          docker run --rm \
+            -e FIO_SOURCE_COMMIT -e FIO_BUILDER_IMAGE -e FIO_PACKAGING_COMMIT \
+            -v "$PWD/source:/src" -v "$PWD/ci:/packaging:ro" -w /src \
+            "$FIO_BUILDER_IMAGE" sh /packaging/build-linux-static.sh "$FIO_ARCH"
+      - name: Verify binary on Ubuntu outside Alpine
+        run: sh ci/verify-linux-static.sh source/fio source/sync-smoke.json
+      - name: Package binary and matching source
+        env:
+          FIO_ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist "package/fio-linux-$FIO_ARCH"
+          cp source/fio source/COPYING source/BUILDINFO.txt source/config.log ci/linux-static-musl.patch \
+            source/sync-smoke.json "package/fio-linux-$FIO_ARCH/"
+          tar -czf "dist/fio-linux-$FIO_ARCH.tar.gz" -C package "fio-linux-$FIO_ARCH"
+      - name: Upload architecture package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: fio-static-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: fio-static-diagnostics-${{ matrix.arch }}
+          path: |
+            source/config.log
+            source/sync-smoke.json
+          if-no-files-found: ignore
+
+  bundle:
+    name: Bundle verified binaries
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: fio-static-*
+          path: dist
+          merge-multiple: true
+      - name: Generate and verify checksums
+        working-directory: dist
+        run: |
+          test -s fio-linux-amd64.tar.gz
+          test -s fio-linux-arm64.tar.gz
+          test -s fio-source.tar.gz
+          sha256sum fio-linux-amd64.tar.gz fio-linux-arm64.tar.gz fio-source.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: fio-linux-static
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Create draft release
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+    needs: bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: fio-linux-static
+          path: dist
+      - name: Publish verified assets to a new draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PACKAGING_COMMIT: ${{ github.sha }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^static-fio-[0-9][A-Za-z0-9._-]*$ ]] || {
+            echo 'Release tag must start with static-fio- followed by a version.' >&2
+            exit 1
+          }
+          printf 'Linux amd64 and arm64 static binaries.\n\nBase source commit: %s\nPackaging commit: %s\nUpstream musl fix: a84eece62edd46c1f4c8047f1052ac6181fc8b3e\n\nIncludes patched source, COPYING, build information, and SHA256SUMS.\n' \
+            "$FIO_SOURCE_COMMIT" "$PACKAGING_COMMIT" > notes.txt
+          gh release create "$RELEASE_TAG" dist/* --draft --target "$PACKAGING_COMMIT" \
+            --title "$RELEASE_TAG" --notes-file notes.txt
